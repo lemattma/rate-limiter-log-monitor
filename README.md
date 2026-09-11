@@ -3,6 +3,22 @@
 Reads JSONL API request logs and reports who is exceeding reasonable rate
 limits, what the traffic looked like, and what was wrong with the input.
 
+## Repository contents
+
+| File | What it is |
+|---|---|
+| `README.md` | What was built, the rate-limit rule and why, the output specification, and the assumptions |
+| **`RESEARCH.md`** | What was *considered and rejected*, with primary sources — the algorithm survey, why the median beat an upper percentile, the real-world limits the defaults are calibrated against, and what three rounds of adversarial review changed after the code was already working |
+| **`TODO.md`** | What was deliberately deferred, including one known weakness in the shipped code |
+| `report.py`, `traffic/` | The program |
+| `tests/` | 79 tests, no dependencies |
+| `tools/generate_traffic.py` | Synthetic traffic generator used for the performance figures below |
+| `sample_input/requests.jsonl` | The sample log from the brief |
+
+`RESEARCH.md` §8 and `TODO.md` are the two worth reading alongside the code: the
+first records the defects review found in this implementation and the arguments
+that survived it, the second states plainly what is still wrong.
+
 ## Running it
 
 **Requires Python 3.9 or newer. No third-party dependencies — nothing to install.**
@@ -21,21 +37,21 @@ python3 report.py logs/*.jsonl
 
 ### Output style
 
-**Run it in a terminal and you get a readable summary. Redirect or pipe it and
-you get JSON.** `--output json` and `--output text` force either.
+**stdout is JSON, unconditionally.** The brief states one hard output requirement
+— *"prints a single JSON API traffic report to stdout"* — so nothing about the
+environment changes it. A harness that allocates a pty (`docker -t`, pexpect,
+some CI runners) receives exactly the bytes a pipe does.
 
 ```bash
-python3 report.py logs.jsonl                 # readable table (terminal)
-python3 report.py logs.jsonl > report.json   # JSON (redirected)
-python3 report.py logs.jsonl | jq .summary   # JSON (piped)
-python3 report.py --output json logs.jsonl   # JSON, always
+python3 report.py logs.jsonl                 # JSON
+python3 report.py logs.jsonl > report.json   # JSON
+python3 report.py logs.jsonl | jq .summary   # JSON
+python3 report.py --output text logs.jsonl   # readable summary
 ```
 
-The brief specifies a single JSON report on stdout, and that contract is kept
-exactly: anything that captures the output — a redirect, a pipe, a subprocess —
-receives JSON. The readable view exists only for the case where a human is
-looking at a terminal, where raw JSON is the less useful answer. This is the same
-convention `git`, `ls`, `docker` and `gh` use.
+When stdout is a terminal, a one-line note about `--output text` is written to
+**stderr** — the diagnostics channel, which no pipe or redirect captures, so it
+cannot contaminate the report.
 
 ```
 API TRAFFIC REPORT
@@ -54,25 +70,21 @@ RATE LIMITS
   sustained     20 req / 60s  0.333/s  static floor - only 2 client(s), 5 needed to derive
 
   [!] insufficient_population
-      Only 2 client(s) in this input -- too few to derive a threshold from the
-      population, so the static floor of 5 requests / 10s (0.50 req/s) was applied instead.
+      Only 2 client(s) in this input -- too few to derive a threshold from the population, so the
+      static floor of 5 requests / 10s (0.50 req/s) was applied instead.
       -> If you know the intended limit, pass --limit N --window SECONDS.
 
 VIOLATIONS (1)
-  client  rule   peak   rate  busiest window        requests  429s
-  ------  -----  ----  -----  --------------------  --------  ----
-  acct_1  burst     6  0.6/s  10:00:00 -> 10:00:08         6     0
+  client  rule    sev  peak   rate  busiest window        requests  429s
+  ------  -----  ----  ----  -----  --------------------  --------  ----
+  acct_1  burst  1.2x     6  0.6/s  10:00:00 -> 10:00:08         6     0
 ```
 
 The text view is rendered from the finished JSON document rather than computed
 separately, so the two can never disagree. Its one deliberate difference is that
-client and endpoint tables are truncated to the busiest `--top` rows (default 20)
-with the remainder stated — a 2,000-row table is not something anyone reads.
-**JSON output is never truncated.**
-
-Tested on **Python 3.9.25** — matching the 3.9.6 that Apple's Xcode Command Line
-Tools ship, which is what a stock macOS machine runs — and on **Python 3.14.7**.
-Output is byte-identical between them.
+tables are truncated to the busiest `--top` rows (default 20) with the remainder
+stated — a 2,000-row table is not something anyone reads. **JSON output is never
+truncated.**
 
 ### Tests
 
@@ -80,7 +92,7 @@ Output is byte-identical between them.
 python3 -m unittest discover -s tests -t .
 ```
 
-64 tests, no dependencies, well under a second.
+79 tests, no dependencies, well under a second.
 
 ### Options
 
@@ -99,9 +111,11 @@ usage.
 | `--raw-paths` | off | Group endpoints by raw path instead of collapsing ids |
 | `--reorder-buffer N` | `10000` | Records buffered to correct out-of-order timestamps |
 | `--malformed-samples N` | `5` | Malformed lines quoted in the report for debugging |
-| `--output STYLE` | `auto` | `auto` (text in a terminal, JSON when piped), `text`, or `json` |
+| `--output STYLE` | `auto` | `text` for a readable summary; `auto` and `json` both print JSON |
+| `--max-endpoints N` | `10000` | Distinct endpoints tracked before the tail is folded into `(other)` |
 | `--top N` | `20` | Rows per table in text output; JSON is never truncated |
 | `--indent N` | `2` | JSON indentation; `0` for a single compact line |
+| `--version` | — | Print the version and exit |
 
 ---
 
@@ -111,14 +125,15 @@ usage.
    file is never held in memory.
 2. **Parse** each line into a record, leniently — see *Parsing* below.
 3. **Reorder** records through a bounded min-heap so the sliding windows receive
-   them in timestamp order despite interleaved upstream producers.
+   them in timestamp order despite interleaved upstream producers, judging
+   lateness per client.
 4. **Measure** each client's traffic with two sliding windows (burst and
    sustained), recording the busiest window ever observed for every client.
 5. **Derive** the effective limit from the observed traffic, floored by a static
    default.
 6. **Report** counts, peak bursts for every client, violations with evidence,
    ingestion problems, and any calibration warnings — as one JSON document on
-   stdout, or as a readable summary when stdout is a terminal.
+   stdout, or as a readable summary with `--output text`.
 
 Diagnostics go to stderr; stdout carries only the report, so it is safe to pipe.
 Exit code is `0` for any data condition (including an all-malformed file) and
@@ -250,8 +265,14 @@ and warns.
 
 If an upstream gateway already returned 429 to a client, that is evidence rather
 than inference — the same insight behind Google SRE's adaptive throttling, which
-derives its limit from the backend's own rejections. Counted per client at no
-cost.
+derives its limit from the backend's own rejections.
+
+It is used rather than merely displayed: each violation carries `corroborated`,
+and corroborated violations break ties in the ranking. A client flagged by the
+window rule *and* carrying upstream 429s has been independently judged by the
+gateway; one flagged with zero 429s rests on this program's threshold alone. That
+distinction is worth surfacing precisely because the threshold is the part of
+this design least certain to suit an unknown input.
 
 ### This is a detector, not an enforcer
 
@@ -277,46 +298,71 @@ basis for its own recommendations.
 
 One JSON object on stdout (see *Output style* above for when the readable view is
 used instead; it is a projection of this same document). Key order is stable and rows are sorted
-deterministically (busiest first, ties broken alphabetically), so two runs over
+deterministically (violations by severity, everything else busiest first, ties
+broken alphabetically), so two runs over
 the same input are byte-identical and two reports can be diffed meaningfully.
 
 | Section | Contents |
 |---|---|
 | `schema_version` | `"1.0"` |
 | `input` | `sources`, `lines_read` |
-| `summary` | `requests`, `clients`, `endpoints`, `malformed`, `blank_lines`, `first_seen`, `last_seen`, `violating_clients` |
+| `summary` | `requests`, `clients`, `endpoints`, `endpoints_folded`, `malformed`, `blank_lines`, `first_seen`, `last_seen`, `violating_clients` |
 | `ingestion` | `records_accepted`, `records_late`, `blank_lines`, `malformed` (total, `by_reason`, `samples`), `repairs` (total, `by_kind`) |
 | `rate_limits` | `path_normalisation`, `adaptive`, `thresholds`, `violations`, `warnings` |
-| `clients` | one row per client — requests, distinct endpoints, first/last seen, status classes, 429 count, `peak_burst`, `peak_sustained`, `violations` |
-| `endpoints` | one row per endpoint — requests, distinct clients, status classes |
+| `clients` | one row per client — `requests`, `records_excluded`, `first_seen`, `last_seen`, `status_classes`, `rate_limited_responses`, `peak_burst`, `peak_sustained`, `violations` |
+| `endpoints` | one row per endpoint — `requests`, `distinct_clients`, `status_classes` |
 
 `thresholds` carries the effective limit *and how it was reached*, so no number
 in the report is unexplained:
 
 ```json
 "burst": {
-  "window_seconds": 10.0, "floor": 5, "floor_rate_per_second": 0.5,
-  "population": 2, "value": 5,
-  "source": "static_floor", "reason": "insufficient_population",
+  "window_seconds": 10.0,
+  "floor": 5,
+  "floor_rate_per_second": 0.5,
+  "population": 2,
+  "value": 5,
+  "source": "static_floor",
+  "reason": "insufficient_population",
   "required_population": 5
 }
 ```
 
-Each violation carries its own evidence:
+Each violation carries its evidence, and a `severity` — the exceedance ratio,
+which is the only figure comparable across the two windows and is what the list
+is sorted by:
 
 ```json
 {
   "client_id": "acct_1",
-  "violated": ["burst"],
+  "violated": [
+    "burst"
+  ],
+  "severity": 1.2,
+  "corroborated": false,
   "requests": 6,
   "peak_burst": {
-    "count": 6, "window_seconds": 10.0, "rate_per_second": 0.6,
-    "start": "2024-01-15T10:00:00Z", "end": "2024-01-15T10:00:08Z"
+    "count": 6,
+    "window_seconds": 10.0,
+    "rate_per_second": 0.6,
+    "start": "2024-01-15T10:00:00Z",
+    "end": "2024-01-15T10:00:08Z"
+  },
+  "peak_sustained": {
+    "count": 6,
+    "window_seconds": 60.0,
+    "rate_per_second": 0.1,
+    "start": "2024-01-15T10:00:00Z",
+    "end": "2024-01-15T10:00:08Z"
   },
   "rate_limited_responses": 0,
-  "evidence": "6 requests between 2024-01-15T10:00:00Z and 2024-01-15T10:00:08Z exceeds the effective limit of 5 per 10s."
+  "evidence": "6 requests between 2024-01-15T10:00:00Z and 2024-01-15T10:00:08Z exceeds the burst limit of 5 per 10s."
 }
 ```
+
+`corroborated` is true when the upstream gateway already answered that client
+with 429s. Such a violation rests on an independent observer rather than on this
+program's threshold alone, so it breaks ties in the ordering.
 
 `warnings` is where the program admits to uncertainty rather than hiding it.
 Each carries a machine-readable `code`, a human `message`, and a concrete
@@ -328,6 +374,8 @@ Each carries a machine-readable `code`, a human `message`, and a concrete
   derived threshold cannot tell those apart
 - `high_flagged_ratio` — most of the population was flagged, which more likely
   means a mis-calibrated threshold than mass abuse
+- `unattributed_traffic` — records arrived with no usable `client_id`; the
+  aggregate is reported here rather than as a violation, since it names nobody
 - `late_records` — records arrived too far out of order to be placed; burst
   figures may be understated
 
@@ -369,8 +417,17 @@ counts toward that client's traffic.
 | Unknown extra fields | ignored |
 
 The `""` client bucket is annotated in the output so a reader does not mistake it
-for one real client. It still counts toward detection: if a producer is dropping
-client IDs at volume, that bucket *should* look alarming.
+for one real client, and it is **excluded from threshold derivation and from
+violations**. It aggregates every producer that dropped the field, so its peak is
+the combined traffic of arbitrarily many unrelated clients: left in the
+population it is a systematically high sample that pulls the median up and makes
+the detector *less* sensitive, and a violation naming `""` names nobody to
+investigate.
+
+A producer dropping client IDs at volume is still worth knowing about — but it is
+an **ingestion** finding, and the report already has the right home for it. It
+surfaces as the `unattributed_traffic` warning, pointing at the
+`missing_client_id` / `empty_client_id` repair counters.
 
 ### Timestamps are normalised by hand, deliberately
 
@@ -394,15 +451,35 @@ displaced by fewer than `--reorder-buffer` positions.
 Anything displaced further is counted as a **late record**: it still counts
 toward request totals — it is a real request — but is withheld from the window
 computation, because a backwards timestamp corrupts the deque's eviction
-invariant. The report says how many were affected, so burst figures can be read
-with the right amount of trust. Silently producing a slightly wrong number would
-have been the worse option.
+invariant. The report says how many were affected, in total and **per client**,
+so `peak_burst: 0` can be read correctly rather than mistaken for "never
+bursted". Silently producing a slightly wrong number would have been the worse
+option.
+
+**Lateness is judged per client, not against a global high-water mark.** The
+invariant that needs protecting belongs to one client's deque, which is
+indifferent to what any other client did. An earlier version used a global
+watermark, which is strictly stricter than the invariant requires — and the
+excess strictness is not conservative, it discards real traffic. Interleaved
+producers are typically each internally ordered and merely offset from one
+another, which is the shape a global watermark handles worst: a client whose
+producer lagged had *every* record excluded and reported a peak burst of zero.
 
 ### Memory is bounded
 
-`O(buffer + clients)`, measured rather than asserted — see *Performance* below.
-Lines are read one at a time; each client's deque holds only timestamps still
-inside the window. Client cardinality is the one unbounded term — see `TODO.md`.
+`O(buffer + clients + min(endpoints, --max-endpoints))`. Lines are read one at a
+time; each client's deque holds only timestamps still inside the window.
+
+The endpoint term is the one that had to be *bounded* rather than merely counted.
+Endpoint cardinality is attacker-controlled — paths carry identifiers, and with
+`--raw-paths` a single client can mint a new endpoint per request. An earlier
+version of this README claimed `O(buffer + clients)` and called it measured; the
+benchmark varied file size and client count, the two variables that do *not*
+drive that term, while path normalisation held endpoint cardinality at 7. Holding
+rows and clients fixed and moving only endpoint cardinality produced **26.0 MB
+against 279.3 MB**. The cap (default 10,000, tail folded into `(other)`) brings
+that to 34.9 MB with request totals still exact. Client cardinality remains
+unbounded in principle — see `TODO.md`.
 
 ### Path normalisation is on by default
 
@@ -424,14 +501,15 @@ The brief splits this: *"identify clients who violate…"* keys on the client,
 while *"provide visibility into request counts"* is where the endpoint breakdown
 belongs.
 
-`distinct_endpoints` is reported per client, but **it is a count of normalised
-endpoint templates, not a scanning signal**. Because path normalisation is on by
-default, a client touching a thousand distinct widget ids and a client touching
-one both report the same handful of templates — on a generated 1,000-client log,
-every single client reported exactly 7. Detecting endpoint-walking needs raw path
-cardinality relative to request volume, which is a different measurement; I tried
-it, could not demonstrate that it separates scanners from merely-busy clients,
-and did not ship an unvalidated metric. See `TODO.md`.
+`distinct_endpoints` was removed rather than shipped. Under default
+normalisation it counted endpoint *templates*, so a client walking a thousand
+widget ids and one touching a single id reported the same handful — on a
+generated 1,000-client log, every client reported exactly 7. A column identical
+for every row conveys nothing, and the name invites a reading the data does not
+support. Detecting endpoint-walking needs raw path cardinality relative to
+request volume, which is a different measurement; it was tried, could not be
+shown to separate scanners from merely-busy clients, and was not shipped
+unvalidated. See `TODO.md`.
 
 ### Assumptions made
 
@@ -461,59 +539,74 @@ python3 report.py /tmp/day.jsonl > report.json
 
 | Input | Rows | Clients | Size | Wall time | Peak RSS |
 |---|---|---|---|---|---|
-| smoke | 25,827 | 50 | 4 MB | 0.3 s | 25.9 MB |
-| small | 538,678 | 100 | 71 MB | 6.4 s | 26.3 MB |
-| small | 538,678 | 500 | 75 MB | 7.5 s | 28.5 MB |
-| small | 538,678 | **5,000** | 132 MB | 14.7 s | **58.3 MB** |
-| **full day** | **10,175,081** | 2,000 | **1,423 MB** | 145 s | **37.8 MB** |
+| smoke | 25,827 | 50 | 4 MB | 0.3 s | 26.0 MB |
+| small | 538,678 | 100 | 71 MB | 5.9 s | 26.2 MB |
+| small | 538,678 | 500 | 75 MB | 6.5 s | 28.3 MB |
+| small | 538,678 | **5,000** | 132 MB | 12.7 s | **50.9 MB** |
+| **full day** | **10,175,081** | 2,000 | **1,423 MB** | 143 s | **35.4 MB** |
 
-Roughly **74,000 rows/second**, and the memory figures separate the two
-variables that could drive them:
+Roughly **71,000 rows/second**, and the figures are arranged to separate the
+three variables that could drive memory rather than to flatter the result:
 
 - **File size does not.** Going from a 71 MB input to a 1,423 MB input — twenty
-  times the rows — moves peak memory from 26.3 MB to 37.8 MB, and even that rise
-  is explained by the client count rather than the row count.
+  times the rows — moves peak memory from 26.2 MB to 35.4 MB, and even that rise
+  is explained by client count rather than row count.
 - **Client count does.** Holding rows fixed at ~538k and going from 100 to 5,000
-  clients moves peak memory from 26.3 MB to 58.3 MB.
+  clients moves peak memory from 26.2 MB to 50.9 MB.
+- **Endpoint cardinality does too** — which is the term the first version of this
+  table missed entirely, because every run in it had endpoint cardinality pinned
+  at 7 by path normalisation. Holding rows *and* clients fixed and varying only
+  endpoint cardinality: **26.0 MB against 279.3 MB**, now capped to 34.9 MB.
 
-Which gives roughly **25 MB of interpreter baseline plus ~6.5 KB per client**,
-flat in file size. That is the `O(buffer + clients)` design claim, confirmed.
+Which gives roughly **25 MB of interpreter baseline plus ~5 KB per client**, flat
+in file size, with the endpoint term bounded by `--max-endpoints`.
 
 ### Two design decisions, measured
 
 **Path normalisation is not cosmetic.** On the same 538k-row log containing
 scanner-style clients that walk a wide id space:
 
-| Mode | Distinct endpoints |
-|---|---|
-| default (normalised) | **7** |
-| `--raw-paths` | **81,718** |
+| Mode | Endpoints tracked | Folded into `(other)` |
+|---|---|---|
+| default (normalised) | **7** | 0 |
+| `--raw-paths` | 10,001 (the cap) | 71,730 |
+| `--raw-paths --max-endpoints 1000000` | **81,718** | 0 |
 
 Without normalisation the per-endpoint view is 81,718 rows of near-noise and
 tells you nothing. With it, `/v1/widgets/{id}` is a single line carrying 2 million
-requests.
+requests. The middle row is the cap doing its job: memory stays bounded and the
+report states how much detail was folded away, rather than either growing without
+limit or silently losing rows.
 
-**The reorder buffer degrades honestly.** Running the same 2M-row slice at
-different buffer sizes:
+**The reorder buffer degrades honestly — and matters less than it looked.**
+Running the same 2M-row slice at different buffer sizes:
 
 | `--reorder-buffer` | Late records | Violators found | Warning |
 |---|---|---|---|
 | 10,000 (default) | 0 | 173 | — |
 | 100 | 0 | 173 | — |
-| 10 | 557,683 | 155 | `late_records` |
+| 10 | 3,443 | 173 | `late_records` |
 
-An undersized buffer *understates* burst figures — 155 violators instead of 173 —
-which is exactly the failure mode predicted, and the program says so rather than
-quietly reporting the lower number.
+Starving the buffer to 10 records still finds every violator, and the handful of
+records it cannot place are counted and warned about rather than silently
+dropped.
+
+This table used to read 557,683 late records and 155 violators at `--reorder-buffer 10`.
+Almost all of that was an artifact of judging lateness against a global watermark
+rather than per client: interleaved producers each ordered internally were being
+marked late for being offset from one another. Fixing that removed 99.4% of the
+"late" records and the entire violator discrepancy — which is also the honest
+measure of how much the buffer was really contributing.
 
 ### What it found in the day-long log
 
 237 of 2,000 clients exceeded the derived threshold of 18 requests / 10s
-(median peak burst 6 × 3). The six busiest each carried **over 2,500 upstream
-429 responses** — the sliding-window detector and the upstream gateway's own
-throttling decisions agree, having been computed completely independently. The
-`population_saturated` warning fired correctly, because the typical client in
-this generated log already bursts above the static floor.
+(median peak burst 6 × 3), at severities between 6.36× and 6.85× over. All six of
+the busiest carried **over 2,500 upstream 429 responses** and are marked
+`corroborated` — the sliding-window detector and the upstream gateway's own
+throttling decisions agree, having been computed completely independently of each
+other. The `population_saturated` warning fired correctly, because the typical
+client in this generated log already bursts above the static floor.
 
 ---
 
@@ -589,6 +682,8 @@ because the version gap between a development machine and a stock Mac is exactly
 where AI-written code tends to assume a modern runtime — the
 `fromisoformat` trap above is a real instance that testing on 3.9 caught.
 
-**Documents in this repository:** `README.md` (what was built and why),
-`RESEARCH.md` (what was considered and why rejected, with sources), `TODO.md`
-(what was deliberately deferred).
+**Review was the most productive part.** After the implementation was working,
+tested and documented, three rounds of adversarial review still found a critical
+correctness bug, a false headline claim about memory, and a field this README
+itself described as useless. `RESEARCH.md` §8 records what each round changed —
+and the arguments that did not survive it, including one where I was wrong.

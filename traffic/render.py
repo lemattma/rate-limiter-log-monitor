@@ -178,6 +178,10 @@ def render_text(report: Dict[str, Any], top: int = DEFAULT_TOP) -> str:
                 [
                     _truncate(row["client_id"] or "(no client_id)", 28),
                     "+".join(row["violated"]),
+                    # The ranking key. Without it the reader cannot see why rows
+                    # are in the order they are, and raw counts across two
+                    # different windows are not comparable.
+                    "%.2gx" % row["severity"],
                     _num(burst["count"]),
                     "%.3g/s" % burst["rate_per_second"],
                     "%s -> %s" % (_clock(burst["start"]), _clock(burst["end"])),
@@ -187,9 +191,9 @@ def render_text(report: Dict[str, Any], top: int = DEFAULT_TOP) -> str:
             )
         out.extend(
             _table(
-                ["client", "rule", "peak", "rate", "busiest window", "requests", "429s"],
+                ["client", "rule", "sev", "peak", "rate", "busiest window", "requests", "429s"],
                 rows,
-                ["l", "l", "r", "r", "l", "r", "r"],
+                ["l", "l", "r", "r", "r", "l", "r", "r"],
             )
         )
         if len(violations) > top:
