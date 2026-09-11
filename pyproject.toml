@@ -2,7 +2,7 @@
 # nothing else. `dependencies = []` is deliberate and asserted rather than
 # merely absent -- there is no requirements.txt because there is nothing to
 # install. The 3.9 floor matches the interpreter Apple's Command Line Tools
-# ship, and is enforced at runtime in report.py so an older interpreter gets
+# ship, and is enforced at runtime in traffic/__init__.py so an older interpreter gets
 # one clear sentence instead of a traceback.
 
 [project]

@@ -211,13 +211,13 @@ def render_text(report: Dict[str, Any], top: int = DEFAULT_TOP) -> str:
                     _num(row["peak_burst"]["count"]),
                     _num(row["peak_sustained"]["count"]),
                     _num(row["rate_limited_responses"]),
-                    _num(row["distinct_endpoints"]),
+                    _num(row["records_excluded"]),
                     "+".join(row["violations"]) or "-",
                 ]
             )
         out.extend(
             _table(
-                ["client", "requests", "peak", "sust", "429s", "paths", "violations"],
+                ["client", "requests", "peak", "sust", "429s", "excl", "violations"],
                 rows,
                 ["l", "r", "r", "r", "r", "r", "l"],
             )

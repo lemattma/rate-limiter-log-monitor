@@ -84,9 +84,17 @@ class WindowTracker:
         window = self._clients.get(client_id)
         return window.peak if window is not None else Burst()
 
-    def peaks(self) -> List[int]:
-        """Peak burst counts across all clients, for threshold derivation."""
-        return [w.peak.count for w in self._clients.values()]
+    def peaks(self, exclude: Optional[Iterable[str]] = None) -> List[int]:
+        """Peak burst counts across clients, for threshold derivation.
+
+        ``exclude`` drops keys that are not real clients. The empty-client_id
+        bucket is an aggregate of every producer that dropped the field, so its
+        peak is the sum of arbitrarily many unrelated clients' concurrent
+        traffic. Left in, it contributes one systematically high sample to the
+        median and pulls the threshold up, making the detector less sensitive.
+        """
+        skip = set(exclude or ())
+        return [w.peak.count for key, w in self._clients.items() if key not in skip]
 
     def clients(self) -> Iterable[str]:
         return self._clients.keys()

@@ -16,15 +16,26 @@ Anything displaced *further* than that is counted as a late record rather than
 quietly mishandled. Late records still count toward request totals -- they are
 real requests -- but are withheld from the window computation, because feeding a
 backwards timestamp into a rolling deque corrupts its eviction invariant. The
-report says how many were affected so burst figures can be read with the right
-amount of trust.
+report says how many were affected, per client and in total, so burst figures can
+be read with the right amount of trust.
+
+Lateness is judged **per client**, not against a global high-water mark. The
+invariant that needs protecting belongs to one client's deque: ``ClientWindow``
+evicts relative to the newest timestamp *it* has seen, and is indifferent to what
+any other client did. Judging against a global watermark is strictly stricter
+than the invariant requires, and the excess strictness is not conservative -- it
+discards real traffic. Interleaved producers are usually each internally ordered
+and merely offset from one another, which is exactly the shape a global watermark
+handles worst: a client whose producer lags the global maximum would have every
+record excluded and report a peak burst of zero.
 """
 
 from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass
-from typing import Iterable, Iterator, List, Optional, TextIO, Tuple
+from datetime import datetime
+from typing import Dict, Iterable, Iterator, List, Optional, TextIO, Tuple
 
 from .parsing import BLANK, Malformed, ParseResult, Record, parse_line
 
@@ -93,16 +104,19 @@ def stream_events(
     position.
     """
     buffer = ReorderBuffer(buffer_size)
-    last_emitted = None
+    # client_id -> newest timestamp already handed downstream for that client.
+    # Per client, because that is the scope of the ordering invariant the
+    # sliding windows actually require (see module docstring).
+    last_emitted: Dict[str, datetime] = {}
 
     def finalise(event: Event) -> Event:
-        nonlocal last_emitted
         assert event.record is not None
-        when = event.record.timestamp
-        if last_emitted is not None and when < last_emitted:
+        record = event.record
+        seen = last_emitted.get(record.client_id)
+        if seen is not None and record.timestamp < seen:
             event.late = True
         else:
-            last_emitted = when
+            last_emitted[record.client_id] = record.timestamp
         return event
 
     for source, lineno, raw in lines:

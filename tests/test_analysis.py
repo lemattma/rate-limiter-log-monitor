@@ -169,6 +169,145 @@ class ReportShapeTests(unittest.TestCase):
             self.assertIn("rate_per_second", row["peak_burst"])
 
 
+class SeverityAndEvidenceTests(unittest.TestCase):
+    """Ranking and justification must work for both rules, not just burst."""
+
+    def _report(self, cohort_spec):
+        analyzer = Analyzer(Config())
+        n = 0
+        for client_id, offsets in cohort_spec.items():
+            for offset in offsets:
+                n += 1
+                analyzer.consume(Event(RECORD, "t", n, record=Record(
+                    timestamp=BASE + timedelta(seconds=offset), client_id=client_id,
+                    endpoint="/v1/x", status_code=200, request_id="r%d" % n)))
+        return analyzer.report()
+
+    def test_breaching_both_rules_cites_both(self):
+        report = self._report({"both": [i * 0.3 for i in range(30)]})
+        violation = report["rate_limits"]["violations"][0]
+        self.assertEqual(violation["violated"], ["burst", "sustained"])
+        self.assertIn("burst limit", violation["evidence"])
+        self.assertIn("sustained limit", violation["evidence"])
+
+    def test_evidence_names_which_limit(self):
+        report = self._report({"spike": list(range(8))})
+        self.assertIn("burst limit", report["rate_limits"]["violations"][0]["evidence"])
+
+    def test_severity_ranks_across_rules(self):
+        # A 1.20x burst breach must not outrank a 1.50x sustained breach. The
+        # raw counts are not commensurable -- one is over 10s, the other 60s.
+        report = self._report({
+            "mild_burst": [i * 1.5 for i in range(6)],          # 6/10s  = 1.20x
+            "heavy_sustained": [300 + i * 2.0 for i in range(30)],  # 30/60s = 1.50x
+        })
+        order = [v["client_id"] for v in report["rate_limits"]["violations"]]
+        self.assertEqual(order, ["heavy_sustained", "mild_burst"])
+        self.assertAlmostEqual(report["rate_limits"]["violations"][0]["severity"], 1.5, places=2)
+
+    def test_corroboration_breaks_ties(self):
+        analyzer = Analyzer(Config())
+        n = 0
+        for client_id, status in [("quiet", 200), ("throttled", 429)]:
+            for i in range(8):
+                n += 1
+                analyzer.consume(Event(RECORD, "t", n, record=Record(
+                    timestamp=BASE + timedelta(seconds=i), client_id=client_id,
+                    endpoint="/v1/x", status_code=status, request_id="r%d" % n)))
+        violations = analyzer.report()["rate_limits"]["violations"]
+        self.assertEqual([v["client_id"] for v in violations], ["throttled", "quiet"])
+        self.assertTrue(violations[0]["corroborated"])
+        self.assertFalse(violations[1]["corroborated"])
+
+
+class UnattributedTrafficTests(unittest.TestCase):
+    """Records whose producer dropped client_id are an ingestion finding."""
+
+    def _report(self):
+        analyzer = Analyzer(Config())
+        for i in range(12):
+            analyzer.consume(Event(RECORD, "t", i, record=Record(
+                timestamp=BASE + timedelta(seconds=i * 0.5), client_id="",
+                endpoint="/v1/x", status_code=200, request_id="m%d" % i)))
+        for i in range(3):
+            analyzer.consume(Event(RECORD, "t", 100 + i, record=Record(
+                timestamp=BASE + timedelta(seconds=100 + i), client_id="real",
+                endpoint="/v1/x", status_code=200, request_id="r%d" % i)))
+        return analyzer.report()
+
+    def test_not_reported_as_a_violation(self):
+        report = self._report()
+        self.assertEqual([v["client_id"] for v in report["rate_limits"]["violations"]], [])
+        self.assertEqual(report["summary"]["violating_clients"], 0)
+
+    def test_surfaced_as_a_warning_instead(self):
+        codes = {w["code"] for w in self._report()["rate_limits"]["warnings"]}
+        self.assertIn("unattributed_traffic", codes)
+
+    def test_still_visible_in_the_clients_table_with_a_note(self):
+        row = next(r for r in self._report()["clients"] if r["client_id"] == "")
+        self.assertEqual(row["requests"], 12)
+        self.assertIn("note", row)
+
+    def test_excluded_from_threshold_derivation(self):
+        # The bucket aggregates arbitrarily many producers, so its peak is
+        # systematically high; left in, it pulls the median up and makes the
+        # detector less sensitive.
+        analyzer = Analyzer(Config())
+        n = 0
+        for i in range(60):
+            n += 1
+            analyzer.consume(Event(RECORD, "t", n, record=Record(
+                timestamp=BASE + timedelta(seconds=i * 0.1), client_id="",
+                endpoint="/v1/x", status_code=200, request_id="m%d" % n)))
+        for c in range(6):
+            for i in range(2):
+                n += 1
+                analyzer.consume(Event(RECORD, "t", n, record=Record(
+                    timestamp=BASE + timedelta(seconds=200 + c * 50 + i),
+                    client_id="c%d" % c, endpoint="/v1/x", status_code=200,
+                    request_id="r%d" % n)))
+        burst = analyzer.report()["rate_limits"]["thresholds"]["burst"]
+        self.assertEqual(burst["population"], 6)
+        self.assertEqual(burst["median_peak_burst"], 2)
+
+
+class PopulationConsistencyTests(unittest.TestCase):
+    def test_warning_and_threshold_report_the_same_population(self):
+        report = build_report({"acct_1": 6, "acct_2": 2})
+        burst = report["rate_limits"]["thresholds"]["burst"]
+        warning = next(w for w in report["rate_limits"]["warnings"]
+                       if w["code"] == "insufficient_population")
+        self.assertIn("Only %d client(s)" % burst["population"], warning["message"])
+
+
+class EndpointCapTests(unittest.TestCase):
+    """Endpoint cardinality is attacker-controlled and must stay bounded."""
+
+    def _report(self, distinct, cap):
+        analyzer = Analyzer(Config(max_endpoints=cap, normalise_paths=False))
+        for i in range(distinct):
+            analyzer.consume(Event(RECORD, "t", i, record=Record(
+                timestamp=BASE + timedelta(seconds=i), client_id="c",
+                endpoint="/v1/w/%d" % i, status_code=200, request_id="r%d" % i)))
+        return analyzer.report()
+
+    def test_tail_is_folded_once_the_cap_is_reached(self):
+        report = self._report(distinct=500, cap=50)
+        self.assertLessEqual(report["summary"]["endpoints"], 51)
+        self.assertEqual(report["summary"]["endpoints_folded"], 450)
+
+    def test_request_totals_stay_exact(self):
+        report = self._report(distinct=500, cap=50)
+        self.assertEqual(report["summary"]["requests"], 500)
+        self.assertEqual(sum(e["requests"] for e in report["endpoints"]), 500)
+
+    def test_nothing_folded_below_the_cap(self):
+        report = self._report(distinct=20, cap=50)
+        self.assertEqual(report["summary"]["endpoints_folded"], 0)
+        self.assertEqual(report["summary"]["endpoints"], 20)
+
+
 class EndToEndTests(unittest.TestCase):
     def _run(self, *args):
         result = subprocess.run(

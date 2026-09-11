@@ -111,6 +111,46 @@ class ReorderBufferTests(unittest.TestCase):
         self.assertEqual([event.lineno for event in out], [0, 1, 2, 3])
 
 
+class PerClientLatenessTests(unittest.TestCase):
+    """Lateness is a per-client judgement, not a global watermark.
+
+    Interleaved producers are each internally ordered and merely offset from one
+    another. Judged globally, a client whose producer lags has every record
+    excluded and reports a peak burst of zero -- indistinguishable in the output
+    from a client that never bursted.
+    """
+
+    def _lines(self, spec):
+        out = []
+        for i, (client, offset) in enumerate(spec):
+            out.append((
+                "t", i,
+                '{"request_id":"r%d","timestamp":"%s","client_id":"%s",'
+                '"endpoint":"/v1/x","status_code":200}'
+                % (i, at(offset).isoformat().replace("+00:00", "Z"), client),
+            ))
+        return out
+
+    def test_lagging_producer_is_not_penalised(self):
+        # A's stream covers seconds 600-609; B's covers 0-9. Both are internally
+        # ordered. With a global watermark every B record is late.
+        spec = [("A", 600 + i) for i in range(10)] + [("B", i) for i in range(10)]
+        events = list(stream_events(self._lines(spec), buffer_size=0))
+        self.assertEqual(sum(1 for e in events if e.late), 0)
+
+    def test_genuinely_backwards_within_one_client_is_late(self):
+        spec = [("A", 0), ("A", 10), ("A", 5)]
+        events = list(stream_events(self._lines(spec), buffer_size=0))
+        late = [e for e in events if e.late]
+        self.assertEqual(len(late), 1)
+        self.assertEqual(late[0].record.timestamp, at(5))
+
+    def test_one_client_out_of_order_does_not_mark_another_late(self):
+        spec = [("A", 100), ("B", 0), ("A", 101), ("B", 1)]
+        events = list(stream_events(self._lines(spec), buffer_size=0))
+        self.assertEqual(sum(1 for e in events if e.late), 0)
+
+
 class LateRecordTests(unittest.TestCase):
     def _stream(self, offsets, buffer_size):
         lines = [
@@ -132,6 +172,7 @@ class LateRecordTests(unittest.TestCase):
     def test_beyond_buffer_is_flagged_late(self):
         # A record displaced further than the buffer can absorb cannot be
         # placed correctly; it is reported rather than silently mishandled.
+        # Single client, so per-client and global lateness coincide here.
         events = self._stream([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0], buffer_size=2)
         self.assertEqual(sum(1 for e in events if e.late), 1)
 

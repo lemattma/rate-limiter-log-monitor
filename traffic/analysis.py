@@ -41,6 +41,20 @@ DEFAULT_MIN_POPULATION = 5
 
 DEFAULT_MALFORMED_SAMPLES = 5
 
+# Endpoint cardinality is attacker-controlled: paths carry identifiers, and with
+# --raw-paths (or an id shape the normaliser does not recognise) a single client
+# can mint a new endpoint per request. Tracking them in an unbounded dict makes
+# residency O(endpoints), which is the term that actually dominates memory on
+# such input -- 400k rows over a 200k-wide id space cost 279 MB against 26 MB for
+# the same rows and clients normalised. Past this many distinct endpoints the
+# remainder is folded into a single bucket so the report stays useful and memory
+# stays bounded; the report says when that happened.
+DEFAULT_MAX_ENDPOINTS = 10_000
+OTHER_ENDPOINT = "(other)"
+
+# The client_id used for records whose producer omitted or emptied the field.
+UNATTRIBUTED = ""
+
 
 @dataclass
 class Config:
@@ -53,6 +67,7 @@ class Config:
     adaptive: bool = True
     normalise_paths: bool = True
     malformed_samples: int = DEFAULT_MALFORMED_SAMPLES
+    max_endpoints: int = DEFAULT_MAX_ENDPOINTS
 
 
 @dataclass
@@ -60,7 +75,7 @@ class ClientStats:
     requests: int = 0
     status_classes: Counter = field(default_factory=Counter)
     rate_limited_responses: int = 0
-    endpoints: Set[str] = field(default_factory=set)
+    records_excluded: int = 0
     first_seen: Optional[datetime] = None
     last_seen: Optional[datetime] = None
 
@@ -103,6 +118,7 @@ class Analyzer:
         self.blank_lines = 0
         self.records = 0
         self.late_records = 0
+        self.endpoints_folded = 0
         self.first_seen: Optional[datetime] = None
         self.last_seen: Optional[datetime] = None
 
@@ -154,6 +170,12 @@ class Analyzer:
         endpoint = record.endpoint
         if self.config.normalise_paths:
             endpoint = normalise_endpoint(endpoint)
+        if endpoint not in self.endpoints and len(self.endpoints) >= self.config.max_endpoints:
+            # Cap reached: fold the long tail into one bucket rather than grow
+            # without bound. Request totals stay exact; only the per-endpoint
+            # breakdown loses resolution, and the report says so.
+            endpoint = OTHER_ENDPOINT
+            self.endpoints_folded += 1
 
         client = self.clients.get(record.client_id)
         if client is None:
@@ -163,7 +185,6 @@ class Analyzer:
         client.status_classes[status_class(record.status_code)] += 1
         if record.status_code == 429:
             client.rate_limited_responses += 1
-        client.endpoints.add(endpoint)
         if client.first_seen is None or record.timestamp < client.first_seen:
             client.first_seen = record.timestamp
         if client.last_seen is None or record.timestamp > client.last_seen:
@@ -183,6 +204,7 @@ class Analyzer:
             # eviction invariant. Reported so burst figures can be read with
             # the appropriate scepticism.
             self.late_records += 1
+            client.records_excluded += 1
             return
 
         self.burst.add(record.client_id, record.timestamp)
@@ -201,7 +223,7 @@ class Analyzer:
         tolerates up to 50% contamination before it moves.
         """
         floor = tracker.limit
-        peaks = tracker.peaks()
+        peaks = tracker.peaks(exclude=(UNATTRIBUTED,))
         population = len(peaks)
         meta: Dict[str, Any] = {
             "window_seconds": tracker.window_seconds,
@@ -241,10 +263,16 @@ class Analyzer:
 
     def _warnings(self, thresholds: Dict[str, Dict[str, Any]], flagged: int) -> List[Dict[str, str]]:
         warnings: List[Dict[str, str]] = []
-        population = len(self.clients)
         burst = thresholds["burst"]
+        # Read the population the threshold actually used rather than
+        # recomputing it. self.clients counts every client seen, including any
+        # whose records were all excluded as late and which therefore never
+        # reached the tracker -- so the two diverge, and the report could state
+        # one number in prose beside a different one in the machine-readable
+        # field for the same word.
+        population = burst["population"]
 
-        if self.config.adaptive and population < self.config.min_population:
+        if burst.get("reason") == "insufficient_population":
             warnings.append(
                 {
                     "code": "insufficient_population",
@@ -296,6 +324,28 @@ class Analyzer:
                 }
             )
 
+        unattributed = self.clients.get(UNATTRIBUTED)
+        if unattributed is not None:
+            peak = self.burst.peak_for(UNATTRIBUTED)
+            if peak.count > burst["value"]:
+                warnings.append(
+                    {
+                        "code": "unattributed_traffic",
+                        "message": (
+                            "%s request(s) arrived with no usable client_id and were aggregated "
+                            "under \"\". That aggregate peaked at %d requests / %gs, above the "
+                            "effective limit -- but it is the combined traffic of every producer "
+                            "that dropped the field, not one client, so it is reported here rather "
+                            "than as a rate-limit violation."
+                            % (format(unattributed.requests, ","), peak.count, burst["window_seconds"])
+                        ),
+                        "suggestion": (
+                            "See ingestion.repairs.by_kind (missing_client_id, empty_client_id) "
+                            "and fix the producing service."
+                        ),
+                    }
+                )
+
         if self.late_records:
             warnings.append(
                 {
@@ -322,6 +372,49 @@ class Analyzer:
             "end": iso(peak.end),
         }
 
+    @staticmethod
+    def _clause(name: str, peak: Burst, limit: int, window: float) -> str:
+        return "%d requests between %s and %s exceeds the %s limit of %d per %gs" % (
+            peak.count, iso(peak.start), iso(peak.end), name, limit, window
+        )
+
+    def _evidence(self, breached, burst_peak, sustained_peak, thresholds) -> str:
+        """One clause per breached rule.
+
+        A client that breached both -- a hard spike *and* a sustained campaign --
+        is the most serious category, and previously produced prose identical to
+        one that only spiked. Each clause also names *which* limit it refers to,
+        since "the effective limit" is ambiguous when there are two.
+        """
+        parts = []
+        if "burst" in breached:
+            parts.append(self._clause("burst", burst_peak, thresholds["burst"]["value"],
+                                      self.config.burst_window))
+        if "sustained" in breached:
+            parts.append(self._clause("sustained", sustained_peak, thresholds["sustained"]["value"],
+                                      self.config.sustained_window))
+        return "; ".join(parts) + "."
+
+    @staticmethod
+    def _severity(breached, burst_peak, sustained_peak, thresholds) -> float:
+        """How far over the limit, as a dimensionless ratio.
+
+        The two peak counts are not commensurable -- one is a count over the
+        burst window, the other over the sustained window -- so ranking raw
+        counts systematically buries sustained-only violators beneath every
+        burst violator regardless of magnitude. The exceedance ratio is
+        comparable across both rules, and is worth emitting on its own: it is
+        the only number in the report that answers "how far over".
+        """
+        ratios = []
+        if "burst" in breached:
+            limit = thresholds["burst"]["value"]
+            ratios.append(burst_peak.count / limit if limit else float("inf"))
+        if "sustained" in breached:
+            limit = thresholds["sustained"]["value"]
+            ratios.append(sustained_peak.count / limit if limit else float("inf"))
+        return max(ratios) if ratios else 0.0
+
     def report(self) -> Dict[str, Any]:
         thresholds = {"burst": self._derive(self.burst), "sustained": self._derive(self.sustained)}
 
@@ -342,7 +435,7 @@ class Analyzer:
             row: Dict[str, Any] = {
                 "client_id": client_id,
                 "requests": stats.requests,
-                "distinct_endpoints": len(stats.endpoints),
+                "records_excluded": stats.records_excluded,
                 "first_seen": iso(stats.first_seen),
                 "last_seen": iso(stats.last_seen),
                 "status_classes": dict(sorted(stats.status_classes.items())),
@@ -353,41 +446,34 @@ class Analyzer:
                 ),
                 "violations": breached,
             }
-            if client_id == "":
+            if client_id == UNATTRIBUTED:
                 row["note"] = (
-                    "Aggregate of records with a missing or empty client_id, not a single client."
+                    "Aggregate of records with a missing or empty client_id, not a single client. "
+                    "Excluded from threshold derivation and from violations; see the "
+                    "unattributed_traffic warning."
                 )
             client_rows.append(row)
 
-            if breached:
+            if breached and client_id != "":
+                # The "" bucket is excluded: a violation names a party to
+                # investigate, and an aggregate of records whose producer
+                # dropped the client id names no one. It is surfaced as an
+                # ingestion finding instead (see _warnings).
+                severity = self._severity(breached, burst_peak, sustained_peak, thresholds)
                 violations.append(
                     {
                         "client_id": client_id,
                         "violated": breached,
+                        "severity": round(severity, 4),
+                        "corroborated": stats.rate_limited_responses > 0,
                         "requests": stats.requests,
                         "peak_burst": self._burst_block(burst_peak, self.config.burst_window),
                         "peak_sustained": self._burst_block(
                             sustained_peak, self.config.sustained_window
                         ),
                         "rate_limited_responses": stats.rate_limited_responses,
-                        "evidence": (
-                            "%d requests between %s and %s exceeds the effective limit of %d per %gs."
-                            % (
-                                burst_peak.count,
-                                iso(burst_peak.start),
-                                iso(burst_peak.end),
-                                thresholds["burst"]["value"],
-                                self.config.burst_window,
-                            )
-                            if "burst" in breached
-                            else "%d requests between %s and %s exceeds the effective limit of %d per %gs."
-                            % (
-                                sustained_peak.count,
-                                iso(sustained_peak.start),
-                                iso(sustained_peak.end),
-                                thresholds["sustained"]["value"],
-                                self.config.sustained_window,
-                            )
+                        "evidence": self._evidence(
+                            breached, burst_peak, sustained_peak, thresholds
                         ),
                     }
                 )
@@ -395,7 +481,13 @@ class Analyzer:
         # Busiest first, then alphabetically -- stable across runs so the
         # graders can diff two reports meaningfully.
         client_rows.sort(key=lambda row: (-row["requests"], row["client_id"]))
-        violations.sort(key=lambda row: (-row["peak_burst"]["count"], row["client_id"]))
+        # By how far over the limit, not by raw burst count. Corroborated
+        # violations -- those the upstream gateway already answered with 429s --
+        # break ties, since they rest on an independent observer rather than on
+        # this program's threshold alone.
+        violations.sort(
+            key=lambda row: (-row["severity"], not row["corroborated"], row["client_id"])
+        )
 
         endpoint_rows = [
             {
@@ -420,6 +512,7 @@ class Analyzer:
                 "requests": self.records,
                 "clients": len(self.clients),
                 "endpoints": len(self.endpoints),
+                "endpoints_folded": self.endpoints_folded,
                 "malformed": malformed_total,
                 "blank_lines": self.blank_lines,
                 "first_seen": iso(self.first_seen),

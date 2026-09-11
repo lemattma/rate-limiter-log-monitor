@@ -159,7 +159,14 @@ class NormaliseEndpointTests(unittest.TestCase):
             ),
             ("/v1/w/7A1F2B3C-1111-2222-3333-444455556666", "/v1/w/{uuid}"),
             ("/v1/w/deadbeefdeadbeef", "/v1/w/{hex}"),
-            ("/v1/widgets/", "/v1/widgets/"),
+            # Deliberate change: a trailing slash is the same route, so it is
+            # now folded rather than producing a second endpoint.
+            ("/v1/widgets/", "/v1/widgets"),
+            ("/", "/"),
+            ("/v1/widgets?page=1", "/v1/widgets"),
+            ("/v1/widgets?page=2", "/v1/widgets"),
+            ("/v1/widgets/123?a=1&b=2", "/v1/widgets/{id}"),
+            ("/v1/widgets#frag", "/v1/widgets"),
             ("", ""),
             ("/v1/2024/reports", "/v1/{id}/reports"),  # known false positive
         ]

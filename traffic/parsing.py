@@ -279,6 +279,19 @@ def normalise_endpoint(path: str) -> str:
     """
     if not path:
         return path
+
+    # Strip the query and fragment before looking at segments. Otherwise
+    # ``/v1/widgets?page=1`` and ``?page=2`` are two endpoints, which is the
+    # same unbounded-cardinality failure this function exists to prevent --
+    # and pagination is the commonest way a client generates the request
+    # volume that trips a rate limit in the first place.
+    path = path.partition("#")[0]
+    path = path.partition("?")[0]
+
+    # A trailing slash is the same route. Keep a bare "/" intact.
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/") or "/"
+
     parts = path.split("/")
     out = []
     for part in parts:

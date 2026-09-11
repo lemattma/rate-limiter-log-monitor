@@ -5,8 +5,9 @@ Usage:
     python3 report.py sample_input/requests.jsonl
     cat requests.jsonl | python3 report.py
 
-Writes a single JSON report to stdout. Diagnostics go to stderr so stdout stays
-machine-readable and safe to pipe.
+Writes a single JSON report to stdout. Pass --output text for a readable
+summary instead. Diagnostics go to stderr, so stdout carries only the report and
+stays safe to pipe.
 """
 
 import sys
@@ -20,6 +21,7 @@ from traffic.analysis import (
     DEFAULT_BURST_LIMIT,
     DEFAULT_BURST_WINDOW,
     DEFAULT_MALFORMED_SAMPLES,
+    DEFAULT_MAX_ENDPOINTS,
     DEFAULT_MIN_POPULATION,
     DEFAULT_MULTIPLIER,
     DEFAULT_SUSTAINED_LIMIT,
@@ -38,7 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="report.py",
         description=(
-            "Read JSONL API request logs and print a single JSON traffic report to stdout."
+            "Read JSONL API request logs and print a single JSON traffic report to stdout. "
+            "Pass --output text for a readable summary."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -106,13 +109,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Malformed lines quoted in the report for debugging.",
     )
     parser.add_argument(
+        "--max-endpoints",
+        type=int,
+        default=DEFAULT_MAX_ENDPOINTS,
+        help="Distinct endpoints tracked before the tail is folded into one bucket.",
+    )
+    parser.add_argument(
         "--output",
         choices=("auto", "text", "json"),
         default="auto",
-        help=(
-            "Output style. 'auto' prints a readable summary when stdout is a terminal "
-            "and JSON when it is piped or redirected."
-        ),
+        help="Output style. 'text' prints a readable summary; 'auto' and 'json' both print JSON.",
     )
     parser.add_argument(
         "--top",
@@ -141,25 +147,35 @@ def config_from_args(args: argparse.Namespace) -> Config:
         adaptive=not args.no_adaptive,
         normalise_paths=not args.raw_paths,
         malformed_samples=max(0, args.malformed_samples),
+        max_endpoints=max(1, args.max_endpoints),
     )
 
 
-def resolve_style(choice: str, stream) -> str:
+def resolve_style(choice: str) -> str:
     """Pick the output style.
 
-    'auto' means readable in a terminal, JSON everywhere else. The brief
-    specifies a JSON report on stdout, and that is what anything capturing the
-    output receives -- a redirect, a pipe, or a subprocess. The readable view is
-    strictly for a human looking at a terminal, where raw JSON would be the
-    less useful answer.
+    stdout is JSON unconditionally. The brief states one hard output
+    requirement -- "prints a single JSON API traffic report to stdout" -- and
+    making that conditional on anything, including whether stdout looks like a
+    terminal, breaks it for any harness that allocates a pty (docker -t,
+    pexpect, several CI runners). The readable view is reached explicitly with
+    --output text.
     """
-    if choice != "auto":
-        return choice
+    return "text" if choice == "text" else "json"
+
+
+def hint_text_output(stream) -> None:
+    """Mention the readable view to a human, on stderr only.
+
+    stderr is already established as the diagnostics channel, and no pipe or
+    redirect captures it, so this cannot contaminate the report.
+    """
     try:
-        return "text" if stream.isatty() else "json"
+        interactive = stream.isatty()
     except (AttributeError, ValueError):
-        # A stream that cannot answer the question is not a terminal.
-        return "json"
+        interactive = False
+    if interactive:
+        sys.stderr.write("note: --output text prints a readable summary instead of JSON\n")
 
 
 def validate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
@@ -209,9 +225,11 @@ def main(argv=None) -> int:
 
     document = analyzer.report()
 
-    if resolve_style(args.output, sys.stdout) == "text":
+    if resolve_style(args.output) == "text":
         sys.stdout.write(render_text(document, top=max(1, args.top)))
     else:
+        if args.output == "auto":
+            hint_text_output(sys.stdout)
         indent = args.indent if args.indent > 0 else None
         separators = (",", ": ") if indent else (",", ":")
         json.dump(document, sys.stdout, indent=indent, separators=separators)
