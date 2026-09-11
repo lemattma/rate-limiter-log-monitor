@@ -1,0 +1,13 @@
+# Declarative statement of what this tool needs: Python 3.9 or newer, and
+# nothing else. `dependencies = []` is deliberate and asserted rather than
+# merely absent -- there is no requirements.txt because there is nothing to
+# install. The 3.9 floor matches the interpreter Apple's Command Line Tools
+# ship, and is enforced at runtime in report.py so an older interpreter gets
+# one clear sentence instead of a traceback.
+
+[project]
+name = "api-traffic-report"
+version = "1.0.0"
+description = "Reads JSONL API request logs and reports rate-limit violations."
+requires-python = ">=3.9"
+dependencies = []
