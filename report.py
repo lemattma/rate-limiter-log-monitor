@@ -11,16 +11,6 @@ machine-readable and safe to pipe.
 
 import sys
 
-# Checked before importing anything of our own so that an old interpreter gets
-# one clear sentence instead of a traceback from deep inside a module. Apple's
-# Command Line Tools ship Python 3.9.6, which is the floor this targets.
-if sys.version_info < (3, 9):
-    sys.stderr.write(
-        "api-traffic-report requires Python 3.9 or newer (found %s).\n"
-        % ".".join(str(part) for part in sys.version_info[:3])
-    )
-    raise SystemExit(2)
-
 import argparse
 import json
 import os
