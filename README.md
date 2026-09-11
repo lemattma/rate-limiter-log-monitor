@@ -13,7 +13,7 @@ limits, what the traffic looked like, and what was wrong with the input.
 | `report.py`, `traffic/` | The program |
 | `tests/` | 79 tests, no dependencies |
 | `tools/generate_traffic.py` | Synthetic traffic generator used for the performance figures below |
-| `sample_input/requests.jsonl` | The sample log from the brief |
+| `sample_input/` | The brief's sample log, plus five scenario logs — see *Cookbook* |
 
 `RESEARCH.md` §8 and `TODO.md` are the two worth reading alongside the code: the
 first records the defects review found in this implementation and the arguments
@@ -116,6 +116,103 @@ usage.
 | `--top N` | `20` | Rows per table in text output; JSON is never truncated |
 | `--indent N` | `2` | JSON indentation; `0` for a single compact line |
 | `--version` | — | Print the version and exit |
+
+### Cookbook — the options in action
+
+`sample_input/` carries small scenario logs, each built to make one group of
+options visible. All run instantly.
+
+| File | Shape | Makes visible |
+|---|---|---|
+| `requests.jsonl` | the brief's sample, 2 clients | the population gate and the static floor |
+| `cohort.jsonl` | 10 clients: 8 at 6 req/10s, 2 at 30 | `--multiplier`, `--no-adaptive` |
+| `saturated.jsonl` | 6 clients all at 30 req/10s, no outlier | `--min-population`, why adaptive exists |
+| `dirty.jsonl` | every defect class the parser survives | `--malformed-samples`, repairs |
+| `paths.jsonl` | ids, UUIDs and query strings in paths | `--raw-paths`, `--max-endpoints` |
+| `out_of_order.jsonl` | two interleaved producers, one backwards record | `--reorder-buffer` |
+
+**Deriving a threshold vs. imposing one.** The cohort's typical client bursts at
+6, so the derived limit lands at `3 × 6 = 18` and catches only the two genuine
+abusers. The static floor of 5 flags all ten:
+
+```bash
+python3 report.py --output text sample_input/cohort.jsonl
+#   threshold 18 (derived_median, median 6)   ->  2 of 10 flagged
+
+python3 report.py --no-adaptive sample_input/cohort.jsonl
+#   threshold 5  (static_floor)               -> 10 of 10 flagged, high_flagged_ratio
+
+python3 report.py --multiplier 10 sample_input/cohort.jsonl
+#   threshold 60 (derived_median, median 6)   ->  0 of 10 flagged
+```
+
+`--multiplier` reads as a false-positive budget: raising it from 3 to 10 raises
+the bar from 3× the typical client to 10×.
+
+**Why the derived threshold is the default.** In `saturated.jsonl` every client
+is equally busy and none is out of line with any other, so the correct answer is
+an empty violations list — which a static floor cannot produce:
+
+```bash
+python3 report.py sample_input/saturated.jsonl
+#   threshold 90 -> 0 of 6 flagged, population_saturated
+
+python3 report.py --no-adaptive sample_input/saturated.jsonl
+#   threshold 5  -> 6 of 6 flagged, high_flagged_ratio
+
+python3 report.py --min-population 10 sample_input/saturated.jsonl
+#   6 clients < 10 required -> falls back to the floor, insufficient_population
+```
+
+**Hostile input.** `dirty.jsonl` is 14 lines containing a stringified status
+code, a float status, a naive timestamp, an epoch timestamp, an offset timestamp
+with two fractional digits, truncated JSON, a JSON array, a missing timestamp, an
+unparseable timestamp, a blank line, a record with no `client_id`, an empty
+`client_id`, an uncoercible status and unknown extra fields:
+
+```bash
+python3 report.py --output text sample_input/dirty.jsonl
+#   accepted 8, discarded 5, blank 1, repaired 8
+#   discarded: invalid_json 2, not_an_object 1, missing_timestamp 1, bad_timestamp 1
+#   repaired:  status_code_from_string, status_code_from_float, timestamp_assumed_utc,
+#              timestamp_from_epoch, timestamp_space_separator, missing_client_id, ...
+
+python3 report.py --malformed-samples 0 sample_input/dirty.jsonl   # counts only, no quoted lines
+```
+
+Nothing is silently dropped: every discard has a reason and every coercion is
+named.
+
+**Endpoint cardinality.** `paths.jsonl` has 12 widget ids, 6 paginated URLs and
+4 UUID order paths — 22 distinct raw strings describing 3 real routes:
+
+```bash
+python3 report.py sample_input/paths.jsonl
+#   3 endpoints: /v1/widgets/{id}, /v1/reports, /v2/orders/{uuid}/items
+
+python3 report.py --raw-paths sample_input/paths.jsonl
+#   22 endpoints: /v1/reports?page=1, ?page=2, ... -- the per-endpoint view is now noise
+
+python3 report.py --max-endpoints 2 sample_input/paths.jsonl
+#   2 tracked + "(other)", 4 requests folded -- memory bounded, and the report says so
+```
+
+**Out-of-order producers.** `out_of_order.jsonl` interleaves two producers, each
+internally ordered but offset by ten minutes, plus one record genuinely backwards
+within its own client:
+
+```bash
+python3 report.py --reorder-buffer 0 sample_input/out_of_order.jsonl
+#   late 1 -- only the genuinely backwards record
+#   acct_A peak_burst 8, records_excluded 1
+#   acct_B peak_burst 8, records_excluded 0
+```
+
+With reordering disabled entirely, the lagging producer is still measured
+correctly, because lateness is judged per client rather than against a global
+high-water mark. Only the one record that actually goes backwards inside its own
+client is excluded, and the client row says so.
+
 
 ---
 

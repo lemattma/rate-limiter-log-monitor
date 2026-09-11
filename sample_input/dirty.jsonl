@@ -1,0 +1,14 @@
+{"request_id": "d1", "timestamp": "2024-01-15T10:00:00Z", "client_id": "acct_1", "endpoint": "/v1/widgets", "status_code": 200}
+{"request_id":"d2","timestamp":"2024-01-15T10:00:01Z","client_id":"acct_1","endpoint":"/v1/widgets","status_code":"200"}
+{"request_id":"d3","timestamp":"2024-01-15 10:00:02","client_id":"acct_1","endpoint":"/v1/widgets","status_code":200.0}
+{"request_id":"d4","timestamp":"2024-01-15T10:00:03.12+05:30","client_id":"acct_1","endpoint":"/v1/widgets","status_code":429}
+{"request_id":"d5","timestamp":1705312805,"client_id":"acct_2","endpoint":"/v1/reports","status_code":503}
+this line is not json at all
+{"request_id":"d6","timestamp":
+[1, 2, 3]
+{"request_id":"d7","client_id":"acct_2","endpoint":"/v1/reports","status_code":200}
+{"request_id":"d8","timestamp":"yesterday","client_id":"acct_2","endpoint":"/v1/reports","status_code":200}
+
+{"request_id":"d9","timestamp":"2024-01-15T10:00:06Z","endpoint":"/v1/reports","status_code":200}
+{"request_id":"d10","timestamp":"2024-01-15T10:00:07Z","client_id":"","endpoint":"/v1/reports","status_code":"abc"}
+{"request_id":"d11","timestamp":"2024-01-15T10:00:08Z","client_id":"acct_1","endpoint":"/v1/widgets","status_code":200,"region":"eu","latency_ms":12}
